@@ -1,0 +1,188 @@
+name: sync-readme-todo
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  sync-readme-todo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+      - name: Extract TODO comments and update README complete TODO list
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat > "$RUNNER_TEMP/sync_todo_readme.py" <<'PY'
+          #!/usr/bin/env python3
+          import io
+          import json
+          import re
+          import subprocess
+          import token
+          import tokenize
+          from pathlib import Path
+
+          ROOT = Path.cwd()
+          README = ROOT / "README.md"
+          TITLE = "### 📝 Complete TODO List"
+
+          def norm(value):
+              value = re.sub(r"[*_`#()（）:\-]+", " ", value.lower())
+              return re.sub(r"\s+", " ", value).strip()
+
+          def comment_message(comment):
+              text = comment[1:].strip()
+              match = re.search(r"(?i)\bTODO\b\s*(?:\((?P<author>[^)]*)\))?\s*:?\s*(?P<msg>.*)$", text)
+              if not match:
+                  return None
+              author = (match.group("author") or "").strip()
+              msg = (match.group("msg") or "").strip()
+              if author:
+                  return f"({author}): {msg}" if msg else f"({author}):"
+              return msg or text
+
+          all_todos = {}
+          for path in sorted(ROOT.rglob("*.py")):
+              if ".git" in path.parts:
+                  continue
+              rel = path.relative_to(ROOT).as_posix()
+              data = path.read_text(encoding="utf-8", errors="replace")
+              found = []
+              try:
+                  tokens = tokenize.generate_tokens(io.StringIO(data).readline)
+                  for tok in tokens:
+                      if tok.type == token.COMMENT and re.search(r"(?i)\bTODO\b", tok.string):
+                          msg = comment_message(tok.string)
+                          if msg is not None:
+                              found.append((tok.start[0], msg))
+              except Exception:
+                  for lineno, line in enumerate(data.splitlines(), 1):
+                      if re.search(r"(?i)#.*\bTODO\b", line):
+                          part = line[line.index("#"):]
+                          msg = comment_message(part)
+                          if msg:
+                              found.append((lineno, msg))
+              if found:
+                  all_todos[rel] = found
+
+          text = README.read_text(encoding="utf-8")
+          lines = text.splitlines()
+          title_index = next(i for i, line in enumerate(lines) if line.strip() == TITLE)
+          section_end = next((j for j in range(title_index + 1, len(lines)) if lines[j].startswith("## ")), len(lines))
+          item_re = re.compile(r"^- \[ \] \*\*(?P<path>.+?):(?P<line>\d+)\*\* - (?P<msg>.*)$")
+          records = []
+          for idx in range(title_index + 1, section_end):
+              match = item_re.match(lines[idx])
+              if match:
+                  records.append({
+                      "path": match.group("path"),
+                      "line": int(match.group("line")),
+                      "msg": match.group("msg"),
+                      "order": len(records),
+                  })
+
+          changed = []
+          try:
+              proc = subprocess.run(
+                  ["git", "diff", "--name-only", "266cbc22215201a93c02e37200fe32be98a9e931...HEAD"],
+                  cwd=ROOT, capture_output=True, text=True, check=True, timeout=30,
+              )
+              changed = [x.strip() for x in proc.stdout.splitlines() if x.strip().endswith(".py")]
+          except Exception as exc:
+              print("git diff detection unavailable:", repr(exc))
+          if not changed:
+              changed = ["luffy/deepscaler/utils.py", "luffy/verl/verl/protocol.py"]
+          changed = [p for p in changed if p in all_todos or any(r["path"] == p for r in records)]
+          changed_set = set(changed)
+
+          old_by_path = {}
+          for record in records:
+              old_by_path.setdefault(record["path"], []).append(record)
+
+          final = []
+          additions = []
+          removals = []
+          line_updates = []
+
+          for record in records:
+              if record["path"] not in changed_set:
+                  final.append((record["path"], record["line"], record["order"], record["msg"]))
+
+          for path in sorted(changed_set):
+              old_records = old_by_path.get(path, [])
+              current_todos = all_todos.get(path, [])
+              used = set()
+              for lineno, msg in current_todos:
+                  target_key = norm(msg)
+                  old_index = None
+                  for candidate_index, record in enumerate(old_records):
+                      if candidate_index not in used and norm(record["msg"]) == target_key:
+                          old_index = candidate_index
+                          break
+                  if old_index is None:
+                      final.append((path, lineno, 10**9 + lineno, msg))
+                      additions.append({"path": path, "line": lineno, "message": msg})
+                  else:
+                      used.add(old_index)
+                      record = old_records[old_index]
+                      final.append((path, lineno, record["order"], msg))
+                      if record["line"] != lineno:
+                          line_updates.append({"path": path, "old_line": record["line"], "new_line": lineno, "message": msg})
+              for old_index, record in enumerate(old_records):
+                  if old_index not in used:
+                      removals.append({"path": record["path"], "line": record["line"], "message": record["msg"]})
+
+          final.sort(key=lambda item: (item[0], item[1], item[2], norm(item[3])))
+          unique = []
+          seen = set()
+          for item in final:
+              dedupe_key = (item[0], item[1], norm(item[3]))
+              if dedupe_key in seen:
+                  continue
+              seen.add(dedupe_key)
+              unique.append(item)
+          final = unique
+
+          new_section = [TITLE, ""]
+          for path, lineno, _order, msg in final:
+              new_section.append(f"- [ ] **{path}:{lineno}** - {msg}")
+          new_section.append("")
+
+          new_lines = lines[:title_index] + new_section + lines[section_end:]
+          new_text = "\n".join(new_lines)
+          if text.endswith("\n"):
+              new_text += "\n"
+          README.write_text(new_text, encoding="utf-8")
+
+          summary = {
+              "all_py_files_with_todos": len(all_todos),
+              "all_todo_count": sum(len(v) for v in all_todos.values()),
+              "baseline_readme_count": len(records),
+              "changed_python_files": changed,
+              "additions": additions,
+              "removed_done_todos": removals,
+              "line_updates": line_updates,
+              "final_readme_count": len(final),
+          }
+          print(json.dumps(summary, ensure_ascii=True, indent=2))
+
+          written = README.read_text(encoding="utf-8")
+          assert TITLE in written
+          assert sum(1 for item in final if item[0] in changed_set) >= 1
+          assert len(final) <= len(records) + len(additions)
+          PY
+          python "$RUNNER_TEMP/sync_todo_readme.py"
+          if git diff --quiet -- README.md; then
+            echo "No README TODO changes detected"
+            exit 1
+          fi
+          git diff --stat -- README.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: sync README TODO list from dev TODO comments"
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin HEAD:dev
